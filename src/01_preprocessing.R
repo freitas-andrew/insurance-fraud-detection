@@ -1,11 +1,14 @@
 library(dplyr)
 library(lubridate)
+library(reticulate)
 
-# Importing the preprocessing pipeline function
+# Import the preprocessing pipeline function
 source(here::here("src/utils/preprocessing_pipeline.R"))
 
-# Establishing the connection to the DB
-con <- dbConnect(RSQLite::SQLite(), here::here("db", "insurance.db"))
+db_path <- here::here("db", "insurance.db")
+
+# Establish database connection
+con <- DBI::dbConnect(RSQLite::SQLite(), db_path)
 
 # --- Deriving variables shared with fraud_oracle for insurance_claims ---
 # Estimating Claims History, deriving age of vehicle, and days_policy_claim
@@ -30,15 +33,6 @@ insurance_claims <- insurance_claims %>%
     # Vehicle age at incident
     age_of_vehicle = year(suppressWarnings(dmy(incident_date))) - auto_year,
 
-    # Dynamic binning of vehicle age so it matches fraud_oracle
-    AgeOfVehicle_Bin = case_when(
-      is.na(age_of_vehicle) ~ "new",
-      age_of_vehicle <= 1 ~ "new",
-      age_of_vehicle >= 2 & age_of_vehicle <= 7 ~
-        paste0(age_of_vehicle, " years"),
-      age_of_vehicle > 7 ~ "more than 7"
-    ),
-
     # Days between policy bind and incident
     days_policy_claim = as.integer(
       difftime(
@@ -46,16 +40,6 @@ insurance_claims <- insurance_claims %>%
         suppressWarnings(dmy(policy_bind_date)),
         units = "days"
       )
-    ),
-
-    # Binned days_policy_claim (matches fraud_oracle bins)
-    days_policy_claim = case_when(
-      is.na(days_policy_claim) ~ "none",
-      days_policy_claim >= 1 & days_policy_claim <= 7 ~ "1 to 7",
-      days_policy_claim >= 8 & days_policy_claim <= 15 ~ "8 to 15",
-      days_policy_claim >= 16 & days_policy_claim <= 30 ~ "15 to 30",
-      days_policy_claim > 30 ~ "more than 30",
-      TRUE ~ "none"
     )
   )
 
@@ -96,7 +80,8 @@ preprocessing_pipeline(
 rename_map <- c(
   marital_status = "insured_relationship",
   witness_present = "witnesses",
-  is_male = "insured_sex"
+  total_claim = "total_claim_amount",
+  annual_premium = "policy_annual_premium"
 )
 
 # Preprocessing insurance_claims columns
@@ -111,20 +96,73 @@ preprocessing_pipeline(
 # --- ALigning tables ---
 # (done separately so matching is improved)
 
+supplementary_cols <- c(
+  "vehicle_price", "annual_premium", "total_claim", "claim_date"
+)
+
 # Aligning insurance_claims columns w/ fraud_oracle
 preprocessing_pipeline(
   con,
   input_table = "insurance_claims_prepared",
   output_table = "insurance_claims_prepared",
   reference_table = "fraud_oracle_prepared",
-  skip_align = FALSE
+  skip_align = FALSE,
+  supplementary_cols = supplementary_cols
 )
 # Aligning fraud_oracle columns w/ insurance_claims
 collapse_table(
-  con,                 # active database connection
+  con,
   target_table = "fraud_oracle_prepared",
   reference_table = "insurance_claims_prepared",
+  output_table = "fraud_oracle_prepared",
+  supplementary_cols = supplementary_cols
+)
+
+# --- Standardise schema using Python ---
+# Use the project's .venv for Python
+reticulate::use_virtualenv(here::here(".venv"), required = TRUE)
+standardise_schema <- reticulate::import_from_path(
+  "standardise_schema",
+  path = here::here("src/utils")
+)
+
+# Standardise fraud_oracle_prepared
+standardise_schema$standardise_schema(
+  db_path = db_path,
+  tables = list("fraud_oracle_prepared"),
+  ref_table = "fraud_oracle_prepared",
   output_table = "fraud_oracle_prepared"
 )
+
+# Standardise insurance_claims_prepared
+standardise_schema$standardise_schema(
+  db_path = db_path,
+  tables = list("insurance_claims_prepared"),
+  ref_table = "fraud_oracle_prepared",
+  output_table = "insurance_claims_prepared"
+)
+
+# --- Impute missing values and save as combined_imputed ---
+source(here::here("src/utils/impute_missing.R"))
+
+# Specify supplementary columns (not to impute in first pass)
+
+# Impute missing values and get the combined imputed dataframe
+combined_imputed <- impute_missing_data(
+  con,
+  table1 = "fraud_oracle_prepared",
+  table2 = "insurance_claims_prepared",
+  supplementary_cols = supplementary_cols,
+  target_col = "fraud_found"
+)
+
+# Save the imputed combined dataset to the database
+dbWriteTable(
+  con,
+  "combined_imputed",
+  combined_imputed,
+  overwrite = TRUE
+)
+message("✅ Table 'combined_imputed' written to database successfully.")
 
 dbDisconnect(con)

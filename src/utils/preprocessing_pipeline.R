@@ -8,7 +8,7 @@ library(RSQLite)
 library(stringr)
 
 # --- Importing external utility: GloVeb-based column alignment ---
-source(here::here("src", "utils", "glove_align.R"))
+source(here::here("src", "utils", "column_align.R"))
 utils::globalVariables("align_columns")
 
 # --- Function: standardise_bools ---
@@ -259,12 +259,14 @@ prepare_column_names <- function(
 }
 
 # --- Function: collapse_table ---
-# Collapses a table to only the columns it shares with a reference table.
+# Collapses a table to only the columns it shares with a reference table,
+# and ensures supplementary columns are present (filled with NA if missing).
 collapse_table <- function(
   con,                 # active database connection
   target_table,        # table to collapse
   reference_table,     # table to match columns with
-  output_table = NULL  # optional: specify name of table saved to DB
+  output_table = NULL, # optional: specify name of table saved to DB
+  supplementary_cols = NULL # optional: columns to always include
 ) {
   message(paste0(
     "🔹 Starting collapse of table '", target_table,
@@ -292,6 +294,16 @@ collapse_table <- function(
     " shared columns"
   ))
 
+  # --- Add supplementary columns if missing ---
+  if (!is.null(supplementary_cols)) {
+    for (col in supplementary_cols) {
+      if (!(col %in% names(df_collapsed))) {
+        df_collapsed[[col]] <- NA
+        message(paste0("➕ Added supplementary column: '", col, "' (all NA)"))
+      }
+    }
+  }
+
   # Saving collapsed table back to DB
   output_table <- output_table %||% paste0(target_table, "_collapsed")
   dbWriteTable(con, output_table, df_collapsed, overwrite = TRUE)
@@ -317,9 +329,10 @@ preprocessing_pipeline <- function(
   default_year = 2000,    # fallback year when constructing dates
   rename_map = NULL,      # optional: vector for manual column renames
   reference_table = NULL, # optional: collapse against this reference schema
-  threshold = 0.75,        # optional: set threshold for cosine similarity
-  skip_align = TRUE       # optional: TRUE: skip column alignment
-) {                       #           FALSE: skip column name preprocessing
+  threshold = 0.75,       # optional: set threshold for cosine similarity
+  skip_align = TRUE,      # optional: TRUE: skip column alignment
+  supplementary_cols = NULL # NEW: columns to always include in output
+) {
   # Default output name if none provided
   output_table <- output_table %||% paste0(input_table, "_processed")
 
@@ -361,14 +374,24 @@ preprocessing_pipeline <- function(
       con,
       target_table = output_table,
       reference_table,
-      output_table
+      output_table,
+      supplementary_cols = supplementary_cols # Pass through
     )
   } else {
     # If no collapsing, just read the current table
     df <- dbReadTable(con, output_table)
+    # Add supplementary columns if needed
+    if (!is.null(supplementary_cols)) {
+      for (col in supplementary_cols) {
+        if (!(col %in% names(df))) {
+          df[[col]] <- NA
+          message(paste0("➕ Added supplementary column: '", col, "' (all NA)"))
+        }
+      }
+      dbWriteTable(con, output_table, df, overwrite = TRUE)
+    }
   }
 
-  # Pipeline completed
   message(
     paste0("✅ Preprocessing completed. Final table: '", output_table, "'")
   )
